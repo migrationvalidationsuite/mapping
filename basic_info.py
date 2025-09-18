@@ -8,15 +8,54 @@ from collections import defaultdict
 import re
 import numpy as np
 
-class EnhancedDataMapper:
-    """Enhanced Data Mapper that uses mapping configuration files"""
+class SingleFileDataMapper:
+    """Simplified Data Mapper that works with a single Excel file containing all data and mapping"""
     
     def __init__(self):
         self.mapping_config = None
         self.source_data = {}
-        self.lookup_tables = {}
+        self.all_sheets = {}
         
-    def load_mapping_config(self, mapping_df: pd.DataFrame):
+    def load_excel_file(self, excel_file):
+        """Load all sheets from a single Excel file"""
+        try:
+            excel_data = pd.ExcelFile(excel_file)
+            self.all_sheets = {}
+            
+            for sheet_name in excel_data.sheet_names:
+                df = pd.read_excel(excel_file, sheet_name=sheet_name)
+                clean_name = sheet_name.strip()
+                self.all_sheets[clean_name] = df
+            
+            # Auto-detect mapping sheet and data sheets
+            self._auto_detect_sheets()
+            return True
+            
+        except Exception as e:
+            st.error(f"Error loading Excel file: {str(e)}")
+            return False
+    
+    def _auto_detect_sheets(self):
+        """Auto-detect which sheet is mapping and which are data sheets"""
+        mapping_sheet = None
+        
+        # Look for mapping sheet
+        for sheet_name, df in self.all_sheets.items():
+            # Check if this sheet has mapping columns
+            columns = [col.lower() for col in df.columns]
+            if any('target column' in col for col in columns) and any('source table' in col for col in columns):
+                mapping_sheet = sheet_name
+                break
+        
+        if mapping_sheet:
+            self._load_mapping_config(self.all_sheets[mapping_sheet])
+            
+            # Load data sheets (everything except mapping)
+            for sheet_name, df in self.all_sheets.items():
+                if sheet_name != mapping_sheet:
+                    self.source_data[sheet_name] = df
+    
+    def _load_mapping_config(self, mapping_df: pd.DataFrame):
         """Load mapping configuration from DataFrame"""
         self.mapping_config = {}
         
@@ -32,125 +71,77 @@ class EnhancedDataMapper:
                     'default_value': row.get('Default Value', '')
                 }
     
-    def load_source_data(self, data_dict: Dict[str, pd.DataFrame]):
-        """Load all source data tables"""
-        self.source_data = data_dict
+    def _find_data_sheet(self, source_table: str) -> Optional[pd.DataFrame]:
+        """Find the data sheet that corresponds to the source table"""
+        # Direct match
+        if source_table in self.source_data:
+            return self.source_data[source_table]
         
-    def load_lookup_tables(self, lookup_dict: Dict[str, pd.DataFrame]):
-        """Load lookup tables for value transformations"""
-        self.lookup_tables = lookup_dict
+        # Try to find by pattern matching
+        for sheet_name, df in self.source_data.items():
+            if source_table in sheet_name or sheet_name in source_table:
+                return df
+        
+        return None
     
     def _get_value_from_source(self, person_id: str, config: Dict[str, Any]) -> Any:
         """Extract value from source data based on configuration"""
         source_table = config.get('source_table', '')
         technical_field = config.get('technical_field', '')
-        source_field = config.get('source_field', '')
         notes = config.get('notes', '')
         default_value = config.get('default_value', '')
         
-        # Handle different source tables
-        if source_table == 'PA0002':  # Personal Data
-            return self._get_pa0002_value(person_id, technical_field, source_field, notes, default_value)
-        elif source_table == 'PA0105':  # Communication
-            return self._get_pa0105_value(person_id, technical_field, source_field, notes, default_value)
-        elif source_table == 'PA0006':  # Address
-            return self._get_pa0006_value(person_id, technical_field, source_field, notes, default_value)
-        elif source_table == 'PA0001':  # Organizational Assignment
-            return self._get_pa0001_value(person_id, technical_field, source_field, notes, default_value)
-        elif source_table == 'PA0000':  # Actions
-            return self._get_pa0000_value(person_id, technical_field, source_field, notes, default_value)
-        elif source_table == 'Custom':  # Custom logic
-            return self._get_custom_value(person_id, technical_field, source_field, notes, default_value)
+        # Find the appropriate data sheet
+        data_df = self._find_data_sheet(source_table)
+        if data_df is None:
+            return default_value
         
-        return default_value if default_value else None
+        # Find person's record
+        person_records = data_df[data_df['PERNR'].astype(str) == str(person_id)]
+        if person_records.empty:
+            return default_value
+        
+        # Handle specific logic based on source table
+        if source_table == 'PA0105':  # Communication data
+            return self._get_communication_value(person_records, technical_field, notes, default_value)
+        elif source_table == 'PA0006':  # Address data
+            return self._get_address_value(person_records, technical_field, notes, default_value)
+        else:  # PA0002 or other personal data
+            return self._get_personal_value(person_records, technical_field, notes, default_value)
     
-    def _get_pa0002_value(self, person_id: str, technical_field: str, source_field: str, notes: str, default_value: str) -> Any:
-        """Get value from PA0002 Personal Data"""
-        if 'PA0002_Personal Data' not in self.source_data:
-            return default_value
+    def _get_communication_value(self, person_records: pd.DataFrame, technical_field: str, notes: str, default_value: str) -> Any:
+        """Get communication data (email, phone)"""
+        if 'email' in notes.lower() or 'SUBTY=0010' in notes:
+            email_records = person_records[person_records['SUBTY'] == 10]
+            if not email_records.empty:
+                return email_records.iloc[0].get('USRID_LONG', default_value)
+        elif 'phone' in notes.lower() or 'SUBTY=0020' in notes:
+            phone_records = person_records[person_records['SUBTY'] == 20]
+            if not phone_records.empty:
+                return phone_records.iloc[0].get('USRID_LONG', default_value)
         
-        df = self.source_data['PA0002_Personal Data']
-        person_row = df[df['PERNR'].astype(str) == str(person_id)]
-        
-        if person_row.empty:
-            return default_value
-        
-        person_row = person_row.iloc[0]
-        
-        # Get raw value
+        return default_value
+    
+    def _get_address_value(self, person_records: pd.DataFrame, technical_field: str, notes: str, default_value: str) -> Any:
+        """Get address data"""
+        # Get home address (SUBTY=1)
+        home_records = person_records[person_records['SUBTY'] == 1]
+        if not home_records.empty:
+            return home_records.iloc[0].get(technical_field, default_value)
+        return default_value
+    
+    def _get_personal_value(self, person_records: pd.DataFrame, technical_field: str, notes: str, default_value: str) -> Any:
+        """Get personal data with transformations"""
+        person_row = person_records.iloc[0]
         raw_value = person_row.get(technical_field, default_value)
         
-        # Apply transformations based on notes
-        return self._apply_transformations(raw_value, technical_field, notes, person_row)
+        # Apply transformations
+        return self._apply_transformations(raw_value, technical_field, notes, person_row, default_value)
     
-    def _get_pa0105_value(self, person_id: str, technical_field: str, source_field: str, notes: str, default_value: str) -> Any:
-        """Get value from PA0105 Communication Data"""
-        if 'PA0105_Communication' not in self.source_data:
-            return default_value
-        
-        df = self.source_data['PA0105_Communication']
-        person_data = df[df['PERNR'].astype(str) == str(person_id)]
-        
-        if person_data.empty:
-            return default_value
-        
-        # Extract specific communication type based on notes
-        if 'email' in notes.lower() or 'SUBTY=0010' in notes:
-            email_rows = person_data[
-                (person_data['COMM_TYPE'] == 'EMAIL') | 
-                (person_data['SUBTY'] == 10)
-            ]
-            if not email_rows.empty:
-                return email_rows.iloc[0].get('USRID_LONG', default_value)
-        
-        elif 'phone' in notes.lower() or 'SUBTY=0020' in notes:
-            phone_rows = person_data[
-                (person_data['COMM_TYPE'] == 'PHONE') | 
-                (person_data['SUBTY'] == 20)
-            ]
-            if not phone_rows.empty:
-                return phone_rows.iloc[0].get('USRID_LONG', default_value)
-        
-        return default_value
-    
-    def _get_pa0006_value(self, person_id: str, technical_field: str, source_field: str, notes: str, default_value: str) -> Any:
-        """Get value from PA0006 Address Data"""
-        if 'PA0006_Home_Address' not in self.source_data:
-            return default_value
-        
-        df = self.source_data['PA0006_Home_Address']
-        person_data = df[df['PERNR'].astype(str) == str(person_id)]
-        
-        if person_data.empty:
-            return default_value
-        
-        # Get home address (SUBTY=1)
-        home_address = person_data[person_data['SUBTY'] == 1]
-        if not home_address.empty:
-            return home_address.iloc[0].get(technical_field, default_value)
-        
-        return default_value
-    
-    def _get_pa0001_value(self, person_id: str, technical_field: str, source_field: str, notes: str, default_value: str) -> Any:
-        """Get value from PA0001 Organizational Assignment"""
-        # This would be implemented if you have PA0001 data
-        return default_value
-    
-    def _get_pa0000_value(self, person_id: str, technical_field: str, source_field: str, notes: str, default_value: str) -> Any:
-        """Get value from PA0000 Actions"""
-        # This would be implemented if you have PA0000 data
-        return default_value
-    
-    def _get_custom_value(self, person_id: str, technical_field: str, source_field: str, notes: str, default_value: str) -> Any:
-        """Handle custom logic"""
-        if 'organizational assignment' in notes.lower():
-            return default_value
-        return default_value
-    
-    def _apply_transformations(self, value: Any, field_name: str, notes: str, person_row: pd.Series) -> Any:
+    def _apply_transformations(self, value: Any, field_name: str, notes: str, person_row: pd.Series, default_value: str) -> Any:
         """Apply transformations based on notes"""
         if pd.isna(value) or value == '':
-            return None
+            return default_value if default_value else None
         
         # Gender transformations
         if 'gender' in field_name.lower() or 'GESCH' in field_name:
@@ -175,23 +166,6 @@ class EnhancedDataMapper:
             last_name = person_row.get('NACHN', '')
             return f"{first_name} {last_name}".strip()
         
-        # Username generation
-        if 'login username' in notes.lower():
-            if 'PA0105_Communication' in self.source_data:
-                comm_df = self.source_data['PA0105_Communication']
-                person_id = person_row.get('PERNR', '')
-                login_data = comm_df[
-                    (comm_df['PERNR'].astype(str) == str(person_id)) & 
-                    (comm_df['COMM_TYPE'] == 'LOGIN')
-                ]
-                if not login_data.empty:
-                    return login_data.iloc[0].get('USRID', value)
-        
-        # Country/Language lookups
-        if field_name in self.lookup_tables:
-            lookup_df = self.lookup_tables[field_name]
-            # Implement lookup logic based on your lookup table structure
-        
         return value
     
     def _format_date(self, date_value: Any) -> str:
@@ -214,14 +188,20 @@ class EnhancedDataMapper:
     def transform_data(self) -> pd.DataFrame:
         """Transform data according to mapping configuration"""
         if not self.mapping_config or not self.source_data:
-            raise ValueError("Mapping configuration and source data must be loaded first")
+            raise ValueError("Excel file must be loaded first")
         
-        # Get all unique person IDs from PA0002
-        if 'PA0002_Personal Data' not in self.source_data:
-            raise ValueError("PA0002_Personal Data is required as the main data source")
+        # Find the main personal data sheet
+        main_data_sheet = None
+        for sheet_name, df in self.source_data.items():
+            if 'PA0002' in sheet_name or 'Personal' in sheet_name:
+                main_data_sheet = df
+                break
         
-        main_df = self.source_data['PA0002_Personal Data']
-        person_ids = main_df['PERNR'].astype(str).unique()
+        if main_data_sheet is None:
+            raise ValueError("Could not find main personal data sheet (PA0002)")
+        
+        # Get all unique person IDs
+        person_ids = main_data_sheet['PERNR'].astype(str).unique()
         
         # Build result data
         result_rows = []
@@ -243,382 +223,256 @@ def main():
     st.set_page_config(
         page_title="HR Data Mapping Tool",
         page_icon="🔄",
-        layout="wide",
-        initial_sidebar_state="expanded"
+        layout="wide"
     )
     
     st.title("🔄 HR Data Mapping Tool")
-    st.markdown("Transform your HR data using mapping configuration files")
+    st.markdown("**Simple one-file solution**: Upload your Excel file with mapping configuration and data sheets")
     
     # Initialize session state
     if 'mapper' not in st.session_state:
-        st.session_state.mapper = EnhancedDataMapper()
+        st.session_state.mapper = SingleFileDataMapper()
+    if 'file_loaded' not in st.session_state:
+        st.session_state.file_loaded = False
     if 'transformed_data' not in st.session_state:
         st.session_state.transformed_data = None
-    if 'mapping_loaded' not in st.session_state:
-        st.session_state.mapping_loaded = False
     
-    # Sidebar for file uploads
-    with st.sidebar:
-        st.header("📁 File Uploads")
-        
-        # Mapping Configuration
-        st.subheader("1. Mapping Configuration")
-        mapping_file = st.file_uploader(
-            "Upload mapping configuration (Excel/CSV)",
-            type=['xlsx', 'xls', 'csv'],
-            key="mapping_file",
-            help="Upload the file containing Target Column, Source Table, Technical Field mappings"
-        )
-        
-        if mapping_file and not st.session_state.mapping_loaded:
-            try:
-                if mapping_file.name.endswith('.csv'):
-                    mapping_df = pd.read_csv(mapping_file)
-                else:
-                    # Try to find the mapping sheet
-                    excel_file = pd.ExcelFile(mapping_file)
-                    sheet_names = excel_file.sheet_names
-                    
-                    # Look for mapping sheet
-                    mapping_sheet = None
-                    for sheet in sheet_names:
-                        if 'mapping' in sheet.lower():
-                            mapping_sheet = sheet
-                            break
-                    
-                    if not mapping_sheet:
-                        mapping_sheet = st.selectbox("Select Mapping Sheet:", sheet_names)
-                    
-                    mapping_df = pd.read_excel(mapping_file, sheet_name=mapping_sheet)
-                
-                st.session_state.mapper.load_mapping_config(mapping_df)
-                st.session_state.mapping_loaded = True
-                st.success(f"✅ Loaded {len(mapping_df)} mapping rules")
-                
-            except Exception as e:
-                st.error(f"❌ Error loading mapping file: {str(e)}")
-        
-        # Source Data Files
-        st.subheader("2. Source Data Files")
-        
-        uploaded_files = st.file_uploader(
-            "Upload source data files (Excel with multiple sheets)",
-            type=['xlsx', 'xls'],
-            accept_multiple_files=True,
-            key="source_files",
-            help="Upload files containing PA0002, PA0105, PA0006 data"
-        )
-        
-        if uploaded_files:
-            source_data = {}
-            
-            for file in uploaded_files:
-                try:
-                    excel_file = pd.ExcelFile(file)
-                    
-                    for sheet_name in excel_file.sheet_names:
-                        df = pd.read_excel(file, sheet_name=sheet_name)
-                        
-                        # Clean sheet name for consistent access
-                        clean_sheet_name = sheet_name.strip()
-                        source_data[clean_sheet_name] = df
-                        
-                        st.write(f"📊 {clean_sheet_name}: {len(df)} rows")
-                
-                except Exception as e:
-                    st.error(f"❌ Error loading {file.name}: {str(e)}")
-            
-            if source_data:
-                st.session_state.mapper.load_source_data(source_data)
-                st.success(f"✅ Loaded {len(source_data)} data tables")
-        
-        # Lookup Tables (Optional)
-        st.subheader("3. Lookup Tables (Optional)")
-        lookup_files = st.file_uploader(
-            "Upload lookup tables",
-            type=['xlsx', 'xls', 'csv'],
-            accept_multiple_files=True,
-            key="lookup_files",
-            help="Upload files containing language, country, or other lookup data"
-        )
-        
-        if lookup_files:
-            lookup_data = {}
-            
-            for file in lookup_files:
-                try:
-                    if file.name.endswith('.csv'):
-                        df = pd.read_csv(file)
-                        lookup_data[file.name.replace('.csv', '')] = df
-                    else:
-                        excel_file = pd.ExcelFile(file)
-                        for sheet_name in excel_file.sheet_names:
-                            df = pd.read_excel(file, sheet_name=sheet_name)
-                            lookup_data[sheet_name] = df
-                
-                except Exception as e:
-                    st.error(f"❌ Error loading lookup file {file.name}: {str(e)}")
-            
-            if lookup_data:
-                st.session_state.mapper.load_lookup_tables(lookup_data)
-                st.success(f"✅ Loaded {len(lookup_data)} lookup tables")
+    # Single file upload
+    st.header("📁 Upload Your Excel File")
+    st.markdown("Upload the Excel file that contains both your mapping configuration and all data sheets (PA0002, PA0105, PA0006, etc.)")
     
-    # Main content area
-    tab1, tab2, tab3, tab4 = st.tabs(["📋 Configuration Preview", "🔍 Data Preview", "⚡ Transform", "📊 Results"])
+    uploaded_file = st.file_uploader(
+        "Choose Excel file",
+        type=['xlsx', 'xls'],
+        key="excel_file",
+        help="Excel file should contain: Mapping sheet + PA0002_Personal Data + PA0105_Communication + PA0006_Home_Address + any lookup tables"
+    )
     
-    with tab1:
-        st.header("Mapping Configuration Preview")
+    if uploaded_file and not st.session_state.file_loaded:
+        with st.spinner("Loading Excel file..."):
+            if st.session_state.mapper.load_excel_file(uploaded_file):
+                st.session_state.file_loaded = True
+                st.success("✅ Excel file loaded successfully!")
+                st.rerun()
+    
+    if st.session_state.file_loaded:
+        # Show file summary
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Sheets", len(st.session_state.mapper.all_sheets))
+        col2.metric("Data Sheets", len(st.session_state.mapper.source_data))
+        col3.metric("Mapping Rules", len(st.session_state.mapper.mapping_config) if st.session_state.mapper.mapping_config else 0)
         
-        if st.session_state.mapping_loaded and st.session_state.mapper.mapping_config:
-            config = st.session_state.mapper.mapping_config
+        # Tabs for different views
+        tab1, tab2, tab3, tab4 = st.tabs(["📋 File Overview", "🔍 Data Preview", "⚡ Transform", "📊 Results"])
+        
+        with tab1:
+            st.header("File Overview")
             
-            # Create a summary DataFrame
-            config_summary = []
-            for target_field, details in config.items():
-                config_summary.append({
-                    'Target Field': target_field,
-                    'Target Name': details.get('target_name', ''),
-                    'Source Table': details.get('source_table', ''),
-                    'Technical Field': details.get('technical_field', ''),
-                    'Transformation Notes': details.get('notes', '')[:100] + '...' if len(details.get('notes', '')) > 100 else details.get('notes', ''),
-                    'Default Value': details.get('default_value', '')
+            # Show all sheets
+            st.subheader("All Sheets in File")
+            sheet_info = []
+            for sheet_name, df in st.session_state.mapper.all_sheets.items():
+                sheet_type = "Mapping" if sheet_name not in st.session_state.mapper.source_data else "Data"
+                sheet_info.append({
+                    'Sheet Name': sheet_name,
+                    'Type': sheet_type,
+                    'Rows': len(df),
+                    'Columns': len(df.columns),
+                    'Sample Columns': ', '.join(df.columns[:3].tolist()) + ('...' if len(df.columns) > 3 else '')
                 })
             
-            config_df = pd.DataFrame(config_summary)
-            st.dataframe(config_df, use_container_width=True, height=400)
+            sheet_df = pd.DataFrame(sheet_info)
+            st.dataframe(sheet_df, use_container_width=True)
             
-            # Statistics
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Total Fields", len(config))
-            
-            source_tables = [details.get('source_table', '') for details in config.values()]
-            col2.metric("Source Tables", len(set(filter(None, source_tables))))
-            
-            defaults = [details.get('default_value', '') for details in config.values() if details.get('default_value', '')]
-            col3.metric("Fields with Defaults", len(defaults))
-            
-        else:
-            st.info("👆 Please upload your mapping configuration file using the sidebar")
-    
-    with tab2:
-        st.header("Source Data Preview")
-        
-        if hasattr(st.session_state.mapper, 'source_data') and st.session_state.mapper.source_data:
-            
-            # Table selector
-            table_names = list(st.session_state.mapper.source_data.keys())
-            selected_table = st.selectbox("Select table to preview:", table_names)
-            
-            if selected_table:
-                df = st.session_state.mapper.source_data[selected_table]
+            # Show mapping configuration summary
+            if st.session_state.mapper.mapping_config:
+                st.subheader("Mapping Configuration Summary")
                 
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Rows", len(df))
-                col2.metric("Columns", len(df.columns))
-                col3.metric("Memory Usage", f"{df.memory_usage(deep=True).sum() / 1024:.1f} KB")
-                
-                st.subheader(f"Preview: {selected_table}")
-                st.dataframe(df.head(100), use_container_width=True)
-                
-                # Column info
-                with st.expander("Column Information"):
-                    col_info = pd.DataFrame({
-                        'Column': df.columns,
-                        'Type': df.dtypes.astype(str),
-                        'Non-Null Count': df.count(),
-                        'Null Count': df.isnull().sum(),
-                        'Unique Values': df.nunique()
-                    })
-                    st.dataframe(col_info, use_container_width=True)
-        
-        else:
-            st.info("👆 Please upload your source data files using the sidebar")
-    
-    with tab3:
-        st.header("Data Transformation")
-        
-        # Check prerequisites
-        can_transform = (
-            st.session_state.mapping_loaded and 
-            hasattr(st.session_state.mapper, 'source_data') and 
-            st.session_state.mapper.source_data and
-            'PA0002_Personal Data' in st.session_state.mapper.source_data
-        )
-        
-        if can_transform:
-            st.success("✅ Ready to transform data!")
-            
-            # Show transformation summary
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.subheader("Transformation Summary")
-                
-                config = st.session_state.mapper.mapping_config
-                main_df = st.session_state.mapper.source_data['PA0002_Personal Data']
-                
-                st.write(f"**Target Fields**: {len(config)} fields will be created")
-                st.write(f"**Source Records**: {len(main_df)} employees will be processed")
-                
-                # Show source table usage
+                # Group by source table
                 source_tables = {}
-                for details in config.values():
-                    table = details.get('source_table', 'Unknown')
-                    source_tables[table] = source_tables.get(table, 0) + 1
+                for target_field, config in st.session_state.mapper.mapping_config.items():
+                    table = config.get('source_table', 'Unknown')
+                    if table not in source_tables:
+                        source_tables[table] = []
+                    source_tables[table].append(target_field)
                 
-                st.write("**Source Table Usage:**")
-                for table, count in source_tables.items():
-                    available = "✅" if table in st.session_state.mapper.source_data or table == 'Custom' else "❌"
-                    st.write(f"- {table}: {count} fields {available}")
+                for table, fields in source_tables.items():
+                    with st.expander(f"{table} ({len(fields)} fields)"):
+                        st.write(", ".join(fields))
+        
+        with tab2:
+            st.header("Data Preview")
             
-            with col2:
-                if st.button("🚀 Start Transformation", type="primary", use_container_width=True):
+            if st.session_state.mapper.source_data:
+                # Sheet selector
+                sheet_names = list(st.session_state.mapper.source_data.keys())
+                selected_sheet = st.selectbox("Select sheet to preview:", sheet_names)
+                
+                if selected_sheet:
+                    df = st.session_state.mapper.source_data[selected_sheet]
+                    
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Rows", len(df))
+                    col2.metric("Columns", len(df.columns))
+                    
+                    # Show unique person count if PERNR exists
+                    if 'PERNR' in df.columns:
+                        unique_persons = df['PERNR'].nunique()
+                        col3.metric("Unique Persons", unique_persons)
+                    
+                    st.subheader(f"Preview: {selected_sheet}")
+                    st.dataframe(df.head(20), use_container_width=True)
+        
+        with tab3:
+            st.header("Transform Data")
+            
+            # Check if ready to transform
+            can_transform = (
+                st.session_state.mapper.mapping_config and 
+                st.session_state.mapper.source_data and
+                any('PA0002' in sheet or 'Personal' in sheet for sheet in st.session_state.mapper.source_data.keys())
+            )
+            
+            if can_transform:
+                st.success("✅ Ready to transform!")
+                
+                # Show what will be transformed
+                config = st.session_state.mapper.mapping_config
+                st.write(f"**Will create {len(config)} target fields**")
+                
+                # Find main data sheet for person count
+                main_sheet = None
+                for sheet_name, df in st.session_state.mapper.source_data.items():
+                    if 'PA0002' in sheet_name or 'Personal' in sheet_name:
+                        main_sheet = df
+                        break
+                
+                if main_sheet is not None:
+                    person_count = main_sheet['PERNR'].nunique()
+                    st.write(f"**Will process {person_count} employees**")
+                
+                # Transform button
+                if st.button("🚀 Transform Data", type="primary", use_container_width=True):
                     with st.spinner("Transforming data..."):
                         try:
                             transformed_df = st.session_state.mapper.transform_data()
                             st.session_state.transformed_data = transformed_df
-                            st.success("✅ Data transformation completed!")
+                            st.success(f"✅ Transformation completed! Generated {len(transformed_df)} rows with {len(transformed_df.columns)} fields")
                             st.balloons()
                             
                         except Exception as e:
                             st.error(f"❌ Transformation failed: {str(e)}")
-                            st.exception(e)
+                            
+            else:
+                st.warning("⚠️ Cannot transform - missing required data or mapping configuration")
         
-        else:
-            missing_items = []
-            if not st.session_state.mapping_loaded:
-                missing_items.append("📋 Mapping configuration file")
-            if not hasattr(st.session_state.mapper, 'source_data') or not st.session_state.mapper.source_data:
-                missing_items.append("📊 Source data files")
-            elif 'PA0002_Personal Data' not in st.session_state.mapper.source_data:
-                missing_items.append("👤 PA0002_Personal Data (main employee data)")
+        with tab4:
+            st.header("Results")
             
-            st.warning("⚠️ Missing required items:")
-            for item in missing_items:
-                st.write(f"- {item}")
+            if st.session_state.transformed_data is not None:
+                transformed_df = st.session_state.transformed_data
+                
+                # Summary metrics
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Employees", len(transformed_df))
+                col2.metric("Fields", len(transformed_df.columns))
+                
+                # Data completeness
+                total_cells = len(transformed_df) * len(transformed_df.columns)
+                filled_cells = transformed_df.count().sum()
+                completeness = (filled_cells / total_cells * 100) if total_cells > 0 else 0
+                col3.metric("Completeness", f"{completeness:.1f}%")
+                
+                # File size estimate
+                memory_mb = transformed_df.memory_usage(deep=True).sum() / 1024 / 1024
+                col4.metric("Size", f"{memory_mb:.1f} MB")
+                
+                # Data preview
+                st.subheader("Transformed Data Preview")
+                st.dataframe(transformed_df.head(20), use_container_width=True)
+                
+                # Export options
+                st.subheader("📥 Download Results")
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    # Excel export
+                    buffer = BytesIO()
+                    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                        transformed_df.to_excel(writer, sheet_name='Transformed_Data', index=False)
+                    
+                    st.download_button(
+                        label="📊 Download Excel",
+                        data=buffer.getvalue(),
+                        file_name=f"hr_transformed_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+                
+                with col2:
+                    # CSV export
+                    csv_data = transformed_df.to_csv(index=False)
+                    st.download_button(
+                        label="📄 Download CSV",
+                        data=csv_data,
+                        file_name=f"hr_transformed_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+                
+                with col3:
+                    # JSON export
+                    json_data = transformed_df.to_json(orient='records', indent=2)
+                    st.download_button(
+                        label="📋 Download JSON",
+                        data=json_data,
+                        file_name=f"hr_transformed_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.json",
+                        mime="application/json",
+                        use_container_width=True
+                    )
+                
+                # Data quality report
+                with st.expander("📊 Data Quality Report"):
+                    missing_data = transformed_df.isnull().sum()
+                    missing_pct = (missing_data / len(transformed_df) * 100).round(2)
+                    
+                    quality_df = pd.DataFrame({
+                        'Field': missing_data.index,
+                        'Missing Count': missing_data.values,
+                        'Missing %': missing_pct.values,
+                        'Completed Count': len(transformed_df) - missing_data.values
+                    }).sort_values('Missing %', ascending=False)
+                    
+                    st.dataframe(quality_df, use_container_width=True)
+            
+            else:
+                st.info("👆 Transform your data first to see results")
     
-    with tab4:
-        st.header("Transformation Results")
-        
-        if st.session_state.transformed_data is not None:
-            transformed_df = st.session_state.transformed_data
-            
-            # Results summary
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Employees Processed", len(transformed_df))
-            col2.metric("Fields Generated", len(transformed_df.columns))
-            
-            # Calculate completion rate
-            total_fields = len(transformed_df.columns) * len(transformed_df)
-            filled_fields = transformed_df.count().sum()
-            completion_rate = (filled_fields / total_fields * 100) if total_fields > 0 else 0
-            col3.metric("Data Completion", f"{completion_rate:.1f}%")
-            
-            # Memory usage
-            memory_mb = transformed_df.memory_usage(deep=True).sum() / 1024 / 1024
-            col4.metric("Memory Usage", f"{memory_mb:.1f} MB")
-            
-            # Data preview
-            st.subheader("Transformed Data Preview")
-            st.dataframe(transformed_df.head(50), use_container_width=True)
-            
-            # Export options
-            st.subheader("📥 Export Options")
-            
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                # Excel export
-                buffer = BytesIO()
-                with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                    transformed_df.to_excel(writer, sheet_name='Transformed_Data', index=False)
-                    
-                    # Add summary sheet
-                    summary_data = {
-                        'Metric': ['Total Employees', 'Total Fields', 'Data Completion Rate', 'Transformation Date'],
-                        'Value': [len(transformed_df), len(transformed_df.columns), f"{completion_rate:.1f}%", pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')]
-                    }
-                    summary_df = pd.DataFrame(summary_data)
-                    summary_df.to_excel(writer, sheet_name='Summary', index=False)
-                
-                st.download_button(
-                    label="📊 Download Excel",
-                    data=buffer.getvalue(),
-                    file_name=f"hr_transformed_data_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
-            
-            with col2:
-                # CSV export
-                csv_data = transformed_df.to_csv(index=False)
-                st.download_button(
-                    label="📄 Download CSV",
-                    data=csv_data,
-                    file_name=f"hr_transformed_data_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
-            
-            with col3:
-                # JSON export
-                json_data = transformed_df.to_json(orient='records', indent=2)
-                st.download_button(
-                    label="📋 Download JSON",
-                    data=json_data,
-                    file_name=f"hr_transformed_data_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.json",
-                    mime="application/json",
-                    use_container_width=True
-                )
-            
-            # Data Quality Report
-            with st.expander("📊 Data Quality Report", expanded=False):
-                
-                # Missing data analysis
-                missing_data = transformed_df.isnull().sum()
-                missing_pct = (missing_data / len(transformed_df) * 100).round(2)
-                
-                quality_df = pd.DataFrame({
-                    'Field': missing_data.index,
-                    'Missing Count': missing_data.values,
-                    'Missing %': missing_pct.values,
-                    'Filled Count': len(transformed_df) - missing_data.values
-                }).sort_values('Missing %', ascending=False)
-                
-                st.subheader("Field Completion Analysis")
-                st.dataframe(quality_df, use_container_width=True)
-                
-                # Unique values analysis for key fields
-                key_fields = ['userId', 'email', 'username', 'firstName', 'lastName']
-                available_key_fields = [field for field in key_fields if field in transformed_df.columns]
-                
-                if available_key_fields:
-                    st.subheader("Key Fields Analysis")
-                    key_analysis = []
-                    
-                    for field in available_key_fields:
-                        unique_count = transformed_df[field].nunique()
-                        duplicate_count = len(transformed_df) - unique_count
-                        key_analysis.append({
-                            'Field': field,
-                            'Unique Values': unique_count,
-                            'Duplicates': duplicate_count,
-                            'Uniqueness %': (unique_count / len(transformed_df) * 100).round(2) if len(transformed_df) > 0 else 0
-                        })
-                    
-                    key_analysis_df = pd.DataFrame(key_analysis)
-                    st.dataframe(key_analysis_df, use_container_width=True)
-        
-        else:
-            st.info("👆 Transform your data first to see results")
+    else:
+        st.info("👆 Upload your Excel file to get started")
     
-    # Footer
-    st.markdown("---")
-    st.markdown(
-        "🔧 **HR Data Mapping Tool** | Built with Streamlit | "
-        "Upload your mapping configuration and source data to get started"
-    )
+    # Instructions
+    with st.expander("📖 How to use this tool"):
+        st.markdown("""
+        **Step 1**: Prepare your Excel file with:
+        - **Mapping sheet**: Contains Target Column, Source Table, Technical Field columns
+        - **Data sheets**: PA0002_Personal Data, PA0105_Communication, PA0006_Home_Address, etc.
+        - **Lookup sheets** (optional): Language codes, country codes, etc.
+        
+        **Step 2**: Upload the single Excel file using the file uploader above
+        
+        **Step 3**: The tool will automatically:
+        - Detect the mapping configuration
+        - Load all data sheets
+        - Show you a preview of what will be transformed
+        
+        **Step 4**: Click "Transform Data" to generate the output
+        
+        **Step 5**: Download the results in your preferred format (Excel, CSV, JSON)
+        
+        That's it! One file upload, automatic processing, complete results.
+        """)
 
 if __name__ == "__main__":
     main()
