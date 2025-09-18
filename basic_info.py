@@ -3,6 +3,7 @@ import streamlit as st
 import numpy as np
 from datetime import datetime
 import re
+from io import BytesIO
 
 class SingleFileDataMapper:
     def __init__(self, excel_file):
@@ -19,107 +20,164 @@ class SingleFileDataMapper:
             all_sheets = pd.read_excel(self.excel_file, sheet_name=None)
             
             for sheet_name, df in all_sheets.items():
-                if sheet_name.upper() in ['MAPPING', 'CONFIG', 'MAPPING_CONFIG']:
+                clean_name = sheet_name.strip()
+                
+                # Check if this is a mapping configuration sheet
+                if self._is_mapping_sheet(df):
                     self.mapping_config = df
-                elif sheet_name.upper().startswith('PA00'):
-                    self.data_sheets[sheet_name] = df
-                elif 'LOOKUP' in sheet_name.upper() or 'REF' in sheet_name.upper():
-                    self.lookup_tables[sheet_name] = df
+                    st.success(f"Found mapping configuration in sheet: {clean_name}")
+                # Check if this is a data sheet
+                elif self._is_data_sheet(df, clean_name):
+                    self.data_sheets[clean_name] = df
+                    st.success(f"Found data sheet: {clean_name}")
+                elif 'LOOKUP' in clean_name.upper() or 'REF' in clean_name.upper():
+                    self.lookup_tables[clean_name] = df
                 else:
-                    self.sheets[sheet_name] = df
+                    self.sheets[clean_name] = df
             
             return True
         except Exception as e:
             st.error(f"Error loading Excel file: {str(e)}")
             return False
     
-    def get_lookup_value(self, lookup_table, key_col, value_col, key):
-        """Get lookup value from reference table"""
-        if lookup_table not in self.lookup_tables:
-            return key
-        
-        lookup_df = self.lookup_tables[lookup_table]
-        if key_col not in lookup_df.columns or value_col not in lookup_df.columns:
-            return key
-        
-        result = lookup_df[lookup_df[key_col] == key]
-        if not result.empty:
-            return result.iloc[0][value_col]
-        return key
+    def _is_mapping_sheet(self, df):
+        """Check if dataframe is a mapping configuration sheet"""
+        columns = [col.lower() for col in df.columns]
+        # Look for key mapping columns
+        has_target = any('target column' in col for col in columns)
+        has_source = any('source' in col and ('table' in col or 'field' in col) for col in columns)
+        return has_target and has_source
     
-    def apply_transformation(self, value, transformation_rule):
-        """Apply transformation based on rule"""
-        if pd.isna(value) or value == '':
-            return None
-            
-        if not transformation_rule or pd.isna(transformation_rule):
-            return value
-        
-        rule = str(transformation_rule).lower()
-        
-        # Date transformation
-        if 'date' in rule and len(str(value)) == 8:
-            try:
-                date_str = str(value)
-                return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
-            except:
-                return value
-        
-        # Gender mapping
-        if 'gender' in rule or 'sex' in rule:
-            gender_map = {'1': 'Male', 'M': 'Male', 'MALE': 'Male',
-                         '2': 'Female', 'F': 'Female', 'FEMALE': 'Female'}
-            return gender_map.get(str(value).upper(), value)
-        
-        # Marital status mapping
-        if 'marital' in rule:
-            marital_map = {'0': 'Single', '1': 'Married', '2': 'Divorced', '3': 'Widowed'}
-            return marital_map.get(str(value), value)
-        
-        # Name concatenation
-        if 'concat' in rule:
-            return str(value).strip()
-        
-        return value
+    def _is_data_sheet(self, df, sheet_name):
+        """Check if dataframe is a data sheet"""
+        # Check for PERNR column (personnel number)
+        has_pernr = 'PERNR' in df.columns
+        # Check for PA sheet naming convention
+        is_pa_sheet = sheet_name.upper().startswith('PA0')
+        return has_pernr or is_pa_sheet
     
-    def get_source_value(self, personnel_number, source_table, source_field, subtype=None):
+    def get_source_value(self, personnel_number, source_table, source_field, subtype=None, notes=""):
         """Get value from source table for specific personnel number"""
-        if source_table not in self.data_sheets:
+        # Find the matching data sheet
+        target_sheet = None
+        for sheet_name, df in self.data_sheets.items():
+            if source_table in sheet_name.upper() or sheet_name.upper() in source_table.upper():
+                target_sheet = df
+                break
+        
+        if target_sheet is None:
             return None
-            
-        df = self.data_sheets[source_table]
         
         # Handle different personnel number column names
-        pernr_cols = ['PERNR', 'Personnel Number', 'PersonnelNumber', 'EmpID', 'EmployeeID']
         pernr_col = None
-        for col in pernr_cols:
-            if col in df.columns:
+        for col in ['PERNR', 'Personnel Number', 'PersonnelNumber', 'EmpID', 'EmployeeID']:
+            if col in target_sheet.columns:
                 pernr_col = col
                 break
         
         if pernr_col is None:
             return None
         
-        # Filter by personnel number
-        emp_data = df[df[pernr_col] == personnel_number]
+        # Convert personnel number to string for comparison
+        target_sheet = target_sheet.copy()
+        target_sheet[pernr_col] = target_sheet[pernr_col].astype(str)
+        personnel_number = str(personnel_number)
         
-        # Filter by subtype if specified
-        if subtype and 'SUBTY' in df.columns:
-            emp_data = emp_data[emp_data['SUBTY'] == subtype]
-        elif subtype and 'Subtype' in df.columns:
-            emp_data = emp_data[emp_data['Subtype'] == subtype]
+        # Filter by personnel number
+        emp_data = target_sheet[target_sheet[pernr_col] == personnel_number]
         
         if emp_data.empty:
             return None
         
-        # Handle different source field variations
-        possible_fields = [source_field, source_field.upper(), source_field.lower()]
-        for field in possible_fields:
-            if field in emp_data.columns:
-                value = emp_data.iloc[0][field]
-                return value if not pd.isna(value) else None
+        # Handle subtype filtering for communication and address data
+        if subtype or 'SUBTY' in notes:
+            subtype_value = self._extract_subtype_from_notes(notes) if not subtype else subtype
+            if subtype_value and 'SUBTY' in emp_data.columns:
+                emp_data = emp_data[emp_data['SUBTY'] == int(subtype_value)]
+                if emp_data.empty:
+                    return None
+        
+        # Get the field value
+        if source_field in emp_data.columns:
+            value = emp_data.iloc[0][source_field]
+            return value if not pd.isna(value) else None
         
         return None
+    
+    def _extract_subtype_from_notes(self, notes):
+        """Extract subtype number from notes field"""
+        if not isinstance(notes, str):
+            return None
+        
+        # Look for patterns like SUBTY=0010, SUBTY=10, etc.
+        match = re.search(r'SUBTY[=:\s]*(\d+)', notes.upper())
+        if match:
+            return match.group(1).lstrip('0') or '0'  # Remove leading zeros but keep single 0
+        
+        # Look for specific mentions
+        if 'EMAIL' in notes.upper():
+            return '10'  # Email subtype
+        elif 'PHONE' in notes.upper():
+            return '20'  # Phone subtype
+        
+        return None
+    
+    def apply_transformation(self, value, transformation_rule, field_name="", person_row=None):
+        """Apply transformation based on rule and field context"""
+        if pd.isna(value) or value == '':
+            return None
+            
+        if not transformation_rule or pd.isna(transformation_rule):
+            # Apply default transformations based on field name
+            return self._apply_default_transformations(value, field_name, person_row)
+        
+        rule = str(transformation_rule)
+        
+        # Date transformation
+        if 'date' in rule.lower() or len(str(value)) == 8:
+            try:
+                date_str = str(value)
+                if len(date_str) == 8 and date_str.isdigit():
+                    return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+            except:
+                pass
+        
+        # Concatenation for display name
+        if 'concatenate' in rule.lower() and person_row is not None:
+            if 'VORNA' in rule and 'NACHN' in rule:
+                first_name = person_row.get('VORNA', '') or ''
+                last_name = person_row.get('NACHN', '') or ''
+                return f"{first_name} {last_name}".strip()
+        
+        # Apply default transformations
+        return self._apply_default_transformations(value, field_name, person_row)
+    
+    def _apply_default_transformations(self, value, field_name="", person_row=None):
+        """Apply default transformations based on field name patterns"""
+        field_name = field_name.upper()
+        
+        # Gender transformation
+        if 'GESCH' in field_name or 'GENDER' in field_name.upper():
+            gender_map = {'1': 'Male', 'M': 'Male', 'MALE': 'Male',
+                         '2': 'Female', 'F': 'Female', 'FEMALE': 'Female'}
+            return gender_map.get(str(value).upper(), value)
+        
+        # Marital status transformation
+        if 'FAMST' in field_name or 'MARITAL' in field_name.upper():
+            marital_map = {'0': 'Single', '1': 'Married', '2': 'Divorced', 
+                          '3': 'Widowed', '4': 'Separated'}
+            return marital_map.get(str(value), value)
+        
+        # Date fields
+        if any(date_field in field_name for date_field in ['GBDAT', 'BEGDA', 'ENDDA', 'DATE']):
+            if len(str(value)) == 8 and str(value).isdigit():
+                try:
+                    date_str = str(value)
+                    return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+                except:
+                    pass
+        
+        return value
     
     def transform_data(self):
         """Transform data according to mapping configuration"""
@@ -127,16 +185,20 @@ class SingleFileDataMapper:
             st.error("No mapping configuration found")
             return None
         
-        # Get unique personnel numbers from PA0002 (personal data)
-        pa0002_data = self.data_sheets.get('PA0002')
+        # Get PA0002 data (personal data)
+        pa0002_data = None
+        for sheet_name, df in self.data_sheets.items():
+            if 'PA0002' in sheet_name.upper() or 'PERSONAL' in sheet_name.upper():
+                pa0002_data = df
+                break
+        
         if pa0002_data is None:
-            st.error("PA0002 sheet not found")
+            st.error("PA0002 (Personal Data) sheet not found")
             return None
         
         # Find personnel number column
-        pernr_cols = ['PERNR', 'Personnel Number', 'PersonnelNumber', 'EmpID', 'EmployeeID']
         pernr_col = None
-        for col in pernr_cols:
+        for col in ['PERNR', 'Personnel Number', 'PersonnelNumber', 'EmpID']:
             if col in pa0002_data.columns:
                 pernr_col = col
                 break
@@ -145,61 +207,79 @@ class SingleFileDataMapper:
             st.error("Personnel number column not found in PA0002")
             return None
         
-        personnel_numbers = pa0002_data[pernr_col].unique()
+        # Get unique personnel numbers
+        personnel_numbers = pa0002_data[pernr_col].dropna().unique()
+        st.info(f"Processing {len(personnel_numbers)} employees...")
         
-        # Initialize result dataframe
-        target_fields = self.mapping_config['Target Field'].tolist()
+        # Find column names in mapping config
+        target_col = None
+        source_table_col = None
+        source_field_col = None
+        notes_col = None
+        
+        for col in self.mapping_config.columns:
+            col_lower = col.lower()
+            if 'target column' in col_lower and 'successfactor' in col_lower:
+                target_col = col
+            elif 'source table' in col_lower:
+                source_table_col = col
+            elif 'technical field' in col_lower or ('source field' in col_lower and 'ecc' in col_lower):
+                source_field_col = col
+            elif 'notes' in col_lower or 'transformation' in col_lower:
+                notes_col = col
+        
+        if not all([target_col, source_table_col, source_field_col]):
+            st.error("Could not find required columns in mapping configuration")
+            return None
+        
+        # Process each employee
         result_data = []
         
-        for pernr in personnel_numbers:
+        progress_bar = st.progress(0)
+        
+        for idx, pernr in enumerate(personnel_numbers):
             if pd.isna(pernr):
                 continue
-                
+            
             row_data = {}
             
+            # Get person's PA0002 record for transformations
+            person_pa0002 = pa0002_data[pa0002_data[pernr_col] == pernr]
+            person_row = person_pa0002.iloc[0] if not person_pa0002.empty else None
+            
+            # Process each mapping rule
             for _, mapping_row in self.mapping_config.iterrows():
-                target_field = mapping_row.get('Target Field')
-                source_table = mapping_row.get('Source Table')
-                source_field = mapping_row.get('Source Field')
-                transformation = mapping_row.get('Transformation')
-                notes = mapping_row.get('Notes', '')
+                target_field = mapping_row.get(target_col)
+                source_table = mapping_row.get(source_table_col)
+                source_field = mapping_row.get(source_field_col)
+                notes = mapping_row.get(notes_col, '') if notes_col else ''
                 
-                if pd.isna(target_field):
+                if pd.isna(target_field) or target_field.strip() == '':
                     continue
-                
-                # Extract subtype from notes if present
-                subtype = None
-                if isinstance(notes, str) and 'subty' in notes.lower():
-                    subtype_match = re.search(r'subty[=:\s]*(\d+)', notes.lower())
-                    if subtype_match:
-                        subtype = subtype_match.group(1)
                 
                 # Get source value
                 if pd.isna(source_table) or pd.isna(source_field):
                     value = None
                 else:
-                    value = self.get_source_value(pernr, source_table, source_field, subtype)
+                    value = self.get_source_value(pernr, source_table, source_field, notes=notes)
                 
-                # Apply transformation
+                # Apply transformations
                 if value is not None:
-                    value = self.apply_transformation(value, transformation)
+                    value = self.apply_transformation(value, notes, source_field, person_row)
                 
                 row_data[target_field] = value
             
             result_data.append(row_data)
+            
+            # Update progress
+            progress_bar.progress((idx + 1) / len(personnel_numbers))
         
         result_df = pd.DataFrame(result_data)
-        
-        # Handle special cases for name concatenation
-        if 'displayName' in result_df.columns:
-            if 'firstName' in result_df.columns and 'lastName' in result_df.columns:
-                result_df['displayName'] = (
-                    result_df['firstName'].astype(str) + ' ' + result_df['lastName'].astype(str)
-                ).replace('nan nan', None)
         
         # Replace NaN with None for cleaner display
         result_df = result_df.where(pd.notnull(result_df), None)
         
+        st.success(f"✅ Successfully transformed {len(result_df)} employee records!")
         return result_df
     
     def get_data_quality_report(self, transformed_data):
@@ -225,65 +305,85 @@ class SingleFileDataMapper:
 
 # Streamlit Interface
 def main():
-    st.title("HR Data Mapping Tool - Enhanced Version")
+    st.set_page_config(
+        page_title="HR Data Mapping Tool - Fixed",
+        page_icon="🔄",
+        layout="wide"
+    )
+    
+    st.title("🔄 HR Data Mapping Tool - Fixed Version")
     st.write("Transform SAP HR data to SuccessFactors format")
     
     # File upload
-    uploaded_file = st.file_uploader("Upload Excel file with mapping config and data", type=['xlsx', 'xls'])
+    uploaded_file = st.file_uploader(
+        "Upload Excel file with mapping config and data", 
+        type=['xlsx', 'xls'],
+        help="File should contain mapping configuration and PA0002, PA0105, PA0006 data sheets"
+    )
     
     if uploaded_file is not None:
         # Initialize mapper
         mapper = SingleFileDataMapper(uploaded_file)
         
         # Load and detect sheets
+        st.subheader("Loading File...")
         if mapper.load_and_detect_sheets():
-            st.success("✅ File loaded successfully!")
             
-            # Show detected sheets
+            # Show detected sheets summary
             col1, col2, col3 = st.columns(3)
             
             with col1:
-                st.write("**Mapping Config:**")
-                st.write("✅ Found" if mapper.mapping_config is not None else "❌ Missing")
+                st.metric("Mapping Config", "✅ Found" if mapper.mapping_config is not None else "❌ Missing")
             
             with col2:
-                st.write("**Data Sheets:**")
+                st.metric("Data Sheets", len(mapper.data_sheets))
                 for sheet_name in mapper.data_sheets.keys():
-                    st.write(f"✅ {sheet_name}")
+                    st.write(f"• {sheet_name}")
             
             with col3:
-                st.write("**Lookup Tables:**")
+                st.metric("Lookup Tables", len(mapper.lookup_tables))
                 for lookup_name in mapper.lookup_tables.keys():
-                    st.write(f"✅ {lookup_name}")
+                    st.write(f"• {lookup_name}")
             
             # Show mapping configuration preview
             if mapper.mapping_config is not None:
-                st.subheader("Mapping Configuration Preview")
-                st.dataframe(mapper.mapping_config.head(10))
+                st.subheader("📋 Mapping Configuration Preview")
+                st.dataframe(mapper.mapping_config.head(10), use_container_width=True)
             
-            # Show data preview
+            # Show source data previews
             if mapper.data_sheets:
-                st.subheader("Source Data Preview")
-                selected_sheet = st.selectbox("Select sheet to preview:", list(mapper.data_sheets.keys()))
-                if selected_sheet:
-                    st.dataframe(mapper.data_sheets[selected_sheet].head(5))
+                st.subheader("📊 Source Data Preview")
+                
+                tabs = st.tabs(list(mapper.data_sheets.keys()))
+                for i, (sheet_name, df) in enumerate(mapper.data_sheets.items()):
+                    with tabs[i]:
+                        st.write(f"**{sheet_name}** - {len(df)} rows, {len(df.columns)} columns")
+                        
+                        # Show unique employee count if PERNR exists
+                        if 'PERNR' in df.columns:
+                            unique_count = df['PERNR'].nunique()
+                            st.write(f"Unique employees: {unique_count}")
+                        
+                        st.dataframe(df.head(5), use_container_width=True)
             
             # Transform button
-            if st.button("🔄 Transform Data", type="primary"):
-                with st.spinner("Transforming data..."):
+            st.subheader("🚀 Transform Data")
+            
+            if st.button("Transform Data", type="primary", use_container_width=True):
+                with st.spinner("Transforming data... This may take a few minutes for large datasets."):
                     transformed_data = mapper.transform_data()
                     
                     if transformed_data is not None:
-                        st.success("✅ Data transformed successfully!")
+                        st.success("🎉 Data transformation completed!")
                         
                         # Show results
-                        st.subheader("Transformed Data")
-                        st.dataframe(transformed_data)
+                        st.subheader("📋 Transformed Data")
+                        st.dataframe(transformed_data, use_container_width=True)
                         
                         # Data quality report
                         quality_report = mapper.get_data_quality_report(transformed_data)
                         
-                        st.subheader("Data Quality Report")
+                        st.subheader("📊 Data Quality Report")
                         col1, col2 = st.columns(2)
                         
                         with col1:
@@ -304,23 +404,29 @@ def main():
                             })
                         
                         completeness_df = pd.DataFrame(completeness_data)
-                        st.dataframe(completeness_df.sort_values('Completeness %', ascending=False))
+                        st.dataframe(
+                            completeness_df.sort_values('Completeness %', ascending=False),
+                            use_container_width=True
+                        )
                         
                         # Download options
-                        st.subheader("Download Results")
+                        st.subheader("💾 Download Results")
                         
                         col1, col2, col3 = st.columns(3)
                         
                         with col1:
-                            excel_buffer = pd.ExcelWriter('transformed_data.xlsx', engine='xlsxwriter')
-                            transformed_data.to_excel(excel_buffer, index=False, sheet_name='Transformed_Data')
-                            excel_buffer.close()
+                            # Excel download
+                            buffer = BytesIO()
+                            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                                transformed_data.to_excel(writer, sheet_name='Transformed_Data', index=False)
+                                completeness_df.to_excel(writer, sheet_name='Quality_Report', index=False)
                             
                             st.download_button(
                                 label="📊 Download Excel",
-                                data=excel_buffer,
-                                file_name="hr_transformed_data.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                data=buffer.getvalue(),
+                                file_name=f"hr_transformed_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                use_container_width=True
                             )
                         
                         with col2:
@@ -328,8 +434,9 @@ def main():
                             st.download_button(
                                 label="📝 Download CSV",
                                 data=csv_data,
-                                file_name="hr_transformed_data.csv",
-                                mime="text/csv"
+                                file_name=f"hr_transformed_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                mime="text/csv",
+                                use_container_width=True
                             )
                         
                         with col3:
@@ -337,8 +444,9 @@ def main():
                             st.download_button(
                                 label="🔗 Download JSON",
                                 data=json_data,
-                                file_name="hr_transformed_data.json",
-                                mime="application/json"
+                                file_name=f"hr_transformed_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.json",
+                                mime="application/json",
+                                use_container_width=True
                             )
 
 if __name__ == "__main__":
